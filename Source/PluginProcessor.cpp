@@ -1,44 +1,33 @@
 #include "PluginProcessor.h"
+#include "PluginEditor.h"
+#include <cmath>
 
 using APVTS = juce::AudioProcessorValueTreeState;
 
-APVTS::ParameterLayout SimpleVerbAudioProcessor::createLayout()
+APVTS::ParameterLayout SoundMasterAudioProcessor::createLayout()
 {
-    using F = juce::AudioParameterFloat;
-    using ID = juce::ParameterID;
-    using R = juce::NormalisableRange<float>;
-
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> p;
 
-    p.push_back (std::make_unique<F> (ID { "size", 1 },    "Room Size", R (0.0f, 1.0f, 0.001f), 0.5f));
-    p.push_back (std::make_unique<F> (ID { "damping", 1 }, "Damping",   R (0.0f, 1.0f, 0.001f), 0.5f));
-    p.push_back (std::make_unique<F> (ID { "width", 1 },   "Width",     R (0.0f, 1.0f, 0.001f), 1.0f));
-    p.push_back (std::make_unique<F> (ID { "predelay", 1 },"Pre-delay (ms)", R (0.0f, 200.0f, 0.1f), 20.0f));
-    p.push_back (std::make_unique<F> (ID { "lowcut", 1 },  "Low Cut (Hz)",   R (20.0f, 1000.0f, 1.0f, 0.4f), 100.0f));
-    p.push_back (std::make_unique<F> (ID { "highcut", 1 }, "High Cut (Hz)",  R (1000.0f, 20000.0f, 1.0f, 0.4f), 12000.0f));
-    p.push_back (std::make_unique<F> (ID { "mix", 1 },     "Mix",       R (0.0f, 1.0f, 0.001f), 0.3f));
-    p.push_back (std::make_unique<juce::AudioParameterBool> (ID { "freeze", 1 }, "Freeze", false));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "soundmaster", 1 },
+        "Soundmaster",
+        juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f),
+        50.0f,
+        juce::AudioParameterFloatAttributes().withLabel ("%")));
 
     return { p.begin(), p.end() };
 }
 
-SimpleVerbAudioProcessor::SimpleVerbAudioProcessor()
+SoundMasterAudioProcessor::SoundMasterAudioProcessor()
     : AudioProcessor (BusesProperties()
                           .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "PARAMS", createLayout())
 {
-    pSize     = apvts.getRawParameterValue ("size");
-    pDamp     = apvts.getRawParameterValue ("damping");
-    pWidth    = apvts.getRawParameterValue ("width");
-    pPreDelay = apvts.getRawParameterValue ("predelay");
-    pLowCut   = apvts.getRawParameterValue ("lowcut");
-    pHighCut  = apvts.getRawParameterValue ("highcut");
-    pMix      = apvts.getRawParameterValue ("mix");
-    pFreeze   = apvts.getRawParameterValue ("freeze");
+    pMacro = apvts.getRawParameterValue ("soundmaster");
 }
 
-bool SimpleVerbAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+bool SoundMasterAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
     const auto out = layouts.getMainOutputChannelSet();
     if (out != juce::AudioChannelSet::mono() && out != juce::AudioChannelSet::stereo())
@@ -46,102 +35,234 @@ bool SimpleVerbAudioProcessor::isBusesLayoutSupported (const BusesLayout& layout
     return out == layouts.getMainInputChannelSet();
 }
 
-void SimpleVerbAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+void SoundMasterAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    currentSampleRate = sampleRate;
+    sr = sampleRate;
 
     juce::dsp::ProcessSpec spec { sampleRate,
                                   (juce::uint32) samplesPerBlock,
                                   (juce::uint32) getTotalNumOutputChannels() };
 
-    preDelay.setMaximumDelayInSamples ((int) (sampleRate * 0.25) + 1);
+    compressor.prepare (spec);
+    compressor.setAttack (8.0f);
+    compressor.setRelease (140.0f);
+
+    limiter.prepare (spec);
+    limiter.setThreshold (-0.5f);
+    limiter.setRelease (60.0f);
+
+    preDelay.setMaximumDelayInSamples ((int) (sampleRate * 0.1) + 1);
     preDelay.prepare (spec);
+    preDelay.setDelay ((float) (0.025 * sampleRate));
     preDelay.reset();
 
-    lowCut.prepare (spec);
-    lowCut.setType (juce::dsp::StateVariableTPTFilterType::highpass);
-    lowCut.reset();
+    reverbHp.prepare (spec);
+    reverbHp.setType (juce::dsp::StateVariableTPTFilterType::highpass);
+    reverbHp.setCutoffFrequency (250.0f);
+    reverbHp.reset();
 
-    highCut.prepare (spec);
-    highCut.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
-    highCut.reset();
+    reverbLp.prepare (spec);
+    reverbLp.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
+    reverbLp.setCutoffFrequency (9000.0f);
+    reverbLp.reset();
 
     reverb.setSampleRate (sampleRate);
     reverb.reset();
 
-    dryBuffer.setSize (getTotalNumOutputChannels(), samplesPerBlock);
+    wetBuffer.setSize (juce::jmax (1, getTotalNumOutputChannels()), samplesPerBlock);
 
-    lastWetGain = lastDryGain = -1.0f; // wymusza ustawienie przy pierwszym bloku
+    // detektor sybilantów: górnoprzepustowy 6 kHz
+    auto detCoeffs = Coeffs::makeHighPass (sampleRate, 6000.0f, 0.707f);
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        deEssDetect[ch].coefficients = detCoeffs;
+        deEssDetect[ch].reset();
+        hpf[ch].reset();
+        mud[ch].reset();
+        presence[ch].reset();
+        air[ch].reset();
+    }
+
+    envFull = envHf = 0.0f;
+    envAttack  = std::exp (-1.0f / (0.001f * (float) sampleRate));
+    envRelease = std::exp (-1.0f / (0.030f * (float) sampleRate));
+
+    const float a = pMacro->load() * 0.01f;
+    macroSmoothed.reset (sampleRate, 0.05);
+    macroSmoothed.setCurrentAndTargetValue (a);
+
+    updateMacro (a);
+    lastApplied = a;
+    lastMakeupGain = makeupGain;
+    lastReverbGain = reverbGain;
 }
 
-void SimpleVerbAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+// Tu dzieje się cała "magia": jedno pokrętło 0..1 ustawia wszystkie moduły.
+void SoundMasterAudioProcessor::updateMacro (float a)
+{
+    // --- EQ ---
+    const float hpFreq = 20.0f + 65.0f * a;                                   // czyszczenie dołu 20 -> 85 Hz
+    auto hpCoeffs   = Coeffs::makeHighPass (sr, hpFreq, 0.707f);
+    auto mudCoeffs  = Coeffs::makePeakFilter (sr, 300.0f, 1.0f,
+                          juce::Decibels::decibelsToGain (-3.0f * a));       // wycięcie "pudła" do -3 dB
+    auto presCoeffs = Coeffs::makePeakFilter (sr, 3200.0f, 0.8f,
+                          juce::Decibels::decibelsToGain (3.0f * std::sqrt (a))); // obecność do +3 dB
+    auto airCoeffs  = Coeffs::makeHighShelf (sr, 10000.0f, 0.7f,
+                          juce::Decibels::decibelsToGain (4.0f * a));        // "powietrze" do +4 dB
+
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        hpf[ch].coefficients = hpCoeffs;
+        mud[ch].coefficients = mudCoeffs;
+        presence[ch].coefficients = presCoeffs;
+        air[ch].coefficients = airCoeffs;
+    }
+
+    // --- de-esser ---
+    deEssAmount = 0.75f * a;
+
+    // --- kompresor ---
+    const float thr = -6.0f - 18.0f * a;     // próg -6 -> -24 dB
+    const float ratio = 1.0f + 3.5f * a;     // stosunek 1:1 -> 4.5:1
+    compressor.setThreshold (thr);
+    compressor.setRatio (ratio);
+    makeupGain = juce::Decibels::decibelsToGain (0.4f * (-thr) * (1.0f - 1.0f / ratio));
+
+    // --- saturacja (ciepło) ---
+    satMix = 0.7f * a;
+    satDrive = 1.0f + 1.5f * a;
+
+    // --- pogłos ---
+    juce::Reverb::Parameters rp;
+    rp.roomSize   = 0.35f + 0.30f * a;
+    rp.damping    = 0.6f;
+    rp.width      = 1.0f;
+    rp.wetLevel   = 1.0f;
+    rp.dryLevel   = 0.0f;
+    rp.freezeMode = 0.0f;
+    reverb.setParameters (rp);
+    reverbGain = 0.24f * std::pow (a, 1.3f);
+}
+
+void SoundMasterAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
 
-    const int numCh = buffer.getNumChannels();
+    const int numCh = juce::jmin (buffer.getNumChannels(), 2);
     const int n = buffer.getNumSamples();
 
     for (int ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
         buffer.clear (ch, 0, n);
 
-    // kopia sygnału suchego
-    dryBuffer.setSize (numCh, n, false, false, true);
+    // płynna zmiana pokrętła
+    macroSmoothed.setTargetValue (pMacro->load() * 0.01f);
+    const float a = macroSmoothed.skip (n);
+    if (lastApplied < 0.0f || std::abs (a - lastApplied) > 0.0005f)
+    {
+        updateMacro (a);
+        lastApplied = a;
+    }
+
+    float* data[2] = { buffer.getWritePointer (0),
+                       numCh > 1 ? buffer.getWritePointer (1) : nullptr };
+
+    // 1) HPF -> de-esser -> EQ
+    for (int i = 0; i < n; ++i)
+    {
+        float x[2] = { 0.0f, 0.0f };
+        float hf[2] = { 0.0f, 0.0f };
+        float fullAbs = 0.0f, hfAbs = 0.0f;
+
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            const float s = hpf[ch].processSample (data[ch][i]);
+            const float h = deEssDetect[ch].processSample (s);
+            x[ch] = s;
+            hf[ch] = h;
+            fullAbs = juce::jmax (fullAbs, std::abs (s));
+            hfAbs = juce::jmax (hfAbs, std::abs (h));
+        }
+
+        envFull = fullAbs + (fullAbs > envFull ? envAttack : envRelease) * (envFull - fullAbs);
+        envHf   = hfAbs   + (hfAbs   > envHf   ? envAttack : envRelease) * (envHf   - hfAbs);
+
+        // sybilant = dominuje górne pasmo względem całości (niezależne od głośności)
+        const float ratio = envHf / (envFull + 1.0e-6f);
+        float reduction = juce::jlimit (0.0f, 1.0f, (ratio - 0.35f) / 0.4f) * deEssAmount;
+        reduction *= juce::jlimit (0.0f, 1.0f, (envFull - 0.002f) / 0.01f); // cisza = bez reakcji
+
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            float s = x[ch] - hf[ch] * reduction;
+            s = mud[ch].processSample (s);
+            s = presence[ch].processSample (s);
+            s = air[ch].processSample (s);
+            data[ch][i] = s;
+        }
+    }
+
+    // 2) kompresor
+    {
+        juce::dsp::AudioBlock<float> block (buffer);
+        juce::dsp::ProcessContextReplacing<float> ctx (block);
+        compressor.process (ctx);
+    }
+
+    // 3) saturacja + wyrównanie głośności
     for (int ch = 0; ch < numCh; ++ch)
-        dryBuffer.copyFrom (ch, 0, buffer, ch, 0, n);
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            const float s = data[ch][i];
+            const float sat = std::tanh (satDrive * s) / satDrive;
+            data[ch][i] = s + satMix * (sat - s);
+        }
+    }
+    buffer.applyGainRamp (0, n, lastMakeupGain, makeupGain);
+    lastMakeupGain = makeupGain;
 
-    // pre-delay + filtry (tylko tor wet)
-    preDelay.setDelay ((float) (*pPreDelay * 0.001 * currentSampleRate));
-    lowCut.setCutoffFrequency (*pLowCut);
-    highCut.setCutoffFrequency (*pHighCut);
+    // 4) pogłos (wysyłka równoległa)
+    wetBuffer.setSize (numCh, n, false, false, true);
+    for (int ch = 0; ch < numCh; ++ch)
+        wetBuffer.copyFrom (ch, 0, buffer, ch, 0, n);
 
-    juce::dsp::AudioBlock<float> block (buffer);
-    juce::dsp::ProcessContextReplacing<float> ctx (block);
-    preDelay.process (ctx);
-    lowCut.process (ctx);
-    highCut.process (ctx);
-
-    // reverb (100% wet)
-    juce::Reverb::Parameters rp;
-    rp.roomSize   = *pSize;
-    rp.damping    = *pDamp;
-    rp.width      = *pWidth;
-    rp.wetLevel   = 1.0f;
-    rp.dryLevel   = 0.0f;
-    rp.freezeMode = *pFreeze > 0.5f ? 1.0f : 0.0f;
-    reverb.setParameters (rp);
+    {
+        juce::dsp::AudioBlock<float> wb (wetBuffer);
+        juce::dsp::ProcessContextReplacing<float> wctx (wb);
+        preDelay.process (wctx);
+        reverbHp.process (wctx);
+        reverbLp.process (wctx);
+    }
 
     if (numCh >= 2)
-        reverb.processStereo (buffer.getWritePointer (0), buffer.getWritePointer (1), n);
+        reverb.processStereo (wetBuffer.getWritePointer (0), wetBuffer.getWritePointer (1), n);
     else
-        reverb.processMono (buffer.getWritePointer (0), n);
+        reverb.processMono (wetBuffer.getWritePointer (0), n);
 
-    // miks (equal-power) z płynną zmianą gainu
-    const float mix = *pMix;
-    const float wetGain = std::sin (mix * juce::MathConstants<float>::halfPi);
-    const float dryGain = std::cos (mix * juce::MathConstants<float>::halfPi);
-
-    if (lastWetGain < 0.0f) { lastWetGain = wetGain; lastDryGain = dryGain; }
-
-    buffer.applyGainRamp (0, n, lastWetGain, wetGain);
     for (int ch = 0; ch < numCh; ++ch)
-        buffer.addFromWithRamp (ch, 0, dryBuffer.getReadPointer (ch), n, lastDryGain, dryGain);
+        buffer.addFromWithRamp (ch, 0, wetBuffer.getReadPointer (ch), n, lastReverbGain, reverbGain);
+    lastReverbGain = reverbGain;
 
-    lastWetGain = wetGain;
-    lastDryGain = dryGain;
+    // 5) limiter bezpieczeństwa
+    {
+        juce::dsp::AudioBlock<float> ob (buffer);
+        juce::dsp::ProcessContextReplacing<float> octx (ob);
+        limiter.process (octx);
+    }
 }
 
-juce::AudioProcessorEditor* SimpleVerbAudioProcessor::createEditor()
+juce::AudioProcessorEditor* SoundMasterAudioProcessor::createEditor()
 {
-    return new juce::GenericAudioProcessorEditor (*this);
+    return new SoundMasterAudioProcessorEditor (*this);
 }
 
-void SimpleVerbAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+void SoundMasterAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     if (auto xml = apvts.copyState().createXml())
         copyXmlToBinary (*xml, destData);
 }
 
-void SimpleVerbAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+void SoundMasterAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         if (xml->hasTagName (apvts.state.getType()))
@@ -150,5 +271,5 @@ void SimpleVerbAudioProcessor::setStateInformation (const void* data, int sizeIn
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new SimpleVerbAudioProcessor();
+    return new SoundMasterAudioProcessor();
 }

@@ -1,28 +1,13 @@
-# SimpleVerb – reverb VST3 (JUCE)
+# SoundMaster – jedno pokrętło, cały tor wokalowy (VST3)
 
-Parametry: Room Size, Damping, Width, Pre-delay, Low Cut, High Cut, Mix, Freeze.
+Jedno pokrętło "Soundmaster" (0–100%) ustawia naraz:
+- EQ: filtr górnoprzepustowy (20→85 Hz), wycięcie pudła 300 Hz (do -3 dB),
+  obecność 3,2 kHz (do +3 dB), "powietrze" 10 kHz (do +4 dB)
+- De-esser (automatycznie wykrywa sybilanty)
+- Kompresor (próg -6→-24 dB, stosunek 1→4,5:1) z automatycznym wyrównaniem głośności
+- Delikatna saturacja (ciepło)
+- Pogłos wokalowy z pre-delay 25 ms (filtrowany, żeby nie zamulał)
+- Limiter bezpieczeństwa
 
-## Najprościej: gotowy plik przez GitHub (bez instalowania czegokolwiek)
-1. Załóż repozytorium na github.com i wrzuć do niego całą zawartość tego folderu
-   (razem z ukrytym folderem `.github`).
-2. Wejdź w zakładkę **Actions** → uruchomi się workflow "Build VST3" (ok. 5–10 min).
-3. Po zakończeniu otwórz przebieg i na dole w **Artifacts** pobierz paczkę
-   dla swojego systemu (`SimpleVerb-Windows-VST3` itd.).
-
-## Instalacja
-Skopiuj folder/plik `SimpleVerb.vst3` do:
-- Windows: `C:\Program Files\Common Files\VST3`
-- macOS:   `/Library/Audio/Plug-Ins/VST3` (jeśli system blokuje: `xattr -cr SimpleVerb.vst3`)
-- Linux:   `~/.vst3`
-
-W REAPERZE: Options → Preferences → Plug-ins → VST → **Re-scan** (Clear cache/re-scan),
-potem dodaj efekt przez FX → "VST3: SimpleVerb (MyCompany)".
-
-## Budowanie lokalnie
-Wymagane: CMake ≥ 3.22, kompilator C++17 (Visual Studio 2022 / Xcode / GCC).
-```
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-```
-Wynik: `build/SimpleVerb_artefacts/Release/VST3/`
-(na Linuksie doinstaluj pakiety z `.github/workflows/build.yml`).
+0% = praktycznie sygnał nieprzetworzony, 100% = pełne przetworzenie.
+Dwuklik na pokrętle = reset do 50%.
